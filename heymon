@@ -1,0 +1,876 @@
+#!/usr/bin/perl
+
+# $Header: /u01/cvs/heymon/heymon,v 2.50 2014/04/25 15:23:46 zac Exp $
+
+use strict;
+use warnings;
+no warnings qw(uninitialized);
+
+use Sys::Hostname;
+use Getopt::Std;
+use Safe;
+use IO::Poll;
+use IO::Handle;
+use IO::Socket;
+use BSD::Resource;
+use MIME::Base64;
+use Data::Dumper; $Data::Dumper::Indent = 1;
+use Text::ParseWords;
+use Net::SMTP;
+use POSIX qw(:sys_wait_h &strftime &setuid &setgid &setsid &tmpnam);
+
+# ========== globals =================================================
+
+my $hostname = &hostname;
+my $logpath = '/var/log/heymon';
+my $etcpath = '/etc/heymon';
+
+# the following values can be overridden in the config
+our $usersock = '/tmp/heymon.sock';
+our $ctrlhost; # = 'localhost';
+our $ctrlport = 4322;
+our $background = 0;
+our $reap_alerts_smtp_host;
+our $reap_alerts_from = 'root';
+our $reap_alerts_to = 'root';
+our $reap_rate_threshold = 1;
+our $reap_rate_period = 60 * 60 * 24;
+
+our %default = (
+#	'uid' => 0,
+#	'gid' => 0,
+#	'cwd' => '/tmp',
+);
+our %job;
+
+my @reaped;
+my %child;
+my %handle;
+
+my $safe = Safe->new;
+$safe->share(qw(
+	$usersock
+	$ctrlhost
+	$ctrlport
+	$background
+	$reap_alerts_smtp_host
+	$reap_alerts_from
+	$reap_alerts_to
+	$reap_rate_threshold
+	$reap_rate_period
+	%default
+	%job
+));
+
+my $poll = IO::Poll->new;
+
+# ========== subs ====================================================
+
+sub log {
+	my $message = shift;
+	my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime;
+	printf("%04d/%02d/%02d %02d:%02d:%02d - %s\n", $year + 1900, $mon + 1, $mday, $hour, $min, $sec, $message);
+}
+
+sub jobs {
+	return sort { $job{$a}{'type'} cmp $job{$b}{'type'} || (defined $job{$a}{'order'} ? (defined $job{$b}{'order'} ? $job{$a}{'order'} <=> $job{$b}{'order'} : -1) : (defined $job{$b}{'order'} ? 1 : 0)) || $a cmp $b } keys %job;
+}
+
+sub process_config {
+	my $dir = shift;
+	if (opendir(DIR, $dir)) {
+		foreach my $file (sort grep { (-f or -l) and !/~$/ } map("$dir/$_", readdir(DIR))) {
+			&log("loading config from $file");
+			$safe->rdo($file);
+			&log("rdo: $@") if ($@);
+		}
+		closedir(DIR);
+	} else {
+		die "couldn't opendir $dir: $!";
+	}
+}
+
+sub process_options {
+	my %opt;
+	&getopts('bnp:s:', \%opt);
+	$background = 1 if (exists $opt{'b'});
+	if (exists $opt{'s'}) {
+		if ($opt{'s'} eq 'none') {
+			undef $usersock;
+		} else {
+			$usersock = $opt{'s'};
+		}
+	}
+	if (exists $opt{'p'}) {
+		if ($opt{'p'} eq 'none') {
+			undef $ctrlport;
+		} elsif ($opt{'p'} =~ /^\d+$/) {
+			$ctrlport = $opt{'p'};
+		} else {
+			die "invalid value for ctrlport: ".$opt{'p'};
+		}
+	}
+	unless (exists $opt{'n'}) {
+		foreach my $job (&jobs) {
+			if (!exists $job{$job}{'type'} or $job{$job}{'type'} eq 'inetd') {
+				$job{$job}{'restart'} = 1;
+			}
+		}
+	}
+}
+
+sub process_defaults {
+	my $time = time;
+	foreach my $job (&jobs) {
+		if (exists $default{'env'}) {
+			foreach my $key (keys %{$default{'env'}}) {
+				$job{$job}{'env'}{$key} = $default{'env'}{$key} unless (exists $job{$job}{'env'}{$key});
+			}
+		}
+		foreach my $key (keys %default) {
+			$job{$job}{$key} = $default{$key} unless (exists $job{$job}{$key});
+		}
+		$job{$job}{'reap_rate_period'} = $reap_rate_period unless (exists $job{$job}{'reap_rate_period'});
+		$job{$job}{'reap_rate_threshold'} = $reap_rate_threshold unless (exists $job{$job}{'reap_rate_threshold'});
+		$job{$job}{'reap_alerts_to'} = $reap_alerts_to unless (exists $job{$job}{'reap_alerts_to'});
+
+		$job{$job}{'time'} = $time;
+		$job{$job}{'reap'} = 0;
+		$job{$job}{'reap_rate'} = 0;
+	}
+}
+
+sub reap {
+	while ((my $pid = waitpid(-1, &WNOHANG)) > 0) {
+		push (@reaped, [$pid, $?, time]);
+	}
+	$SIG{'CHLD'} = \&reap;
+}
+
+sub cleanup_job {
+	my $job = shift;
+	foreach (grep(/^_/, keys %{$job{$job}})) {
+		delete $job{$job}{$_};
+	}
+}
+
+sub handle_reaped {
+	while (my $row = shift (@reaped)) {
+		my ($pid, $status, $time) = @$row;
+		if (exists $child{$pid}) {
+			my $job = $child{$pid};
+			if (exists $job{$job}) {
+				if (&WIFEXITED($status)) {
+					$job{$job}{'time'} = $time;
+					$job{$job}{'_stop'} = &strftime('%Y-%m-%d-%H-%M-%S', localtime($time));
+					$job{$job}{'_exitcode'} = &WEXITSTATUS($status);
+					$job{$job}{'_core'} = $status & 128;
+					$job{$job}{'reap'} += 1;
+					$job{$job}{'reap_rate'} += 1;
+
+					&log(sprintf('reaped job \'%s\': pid=%d exit=%d core=%d reap=%d', $job, $pid, $job{$job}{'_exitcode'}, $job{$job}{'_core'}, $job{$job}{'reap'}));
+					&send_reap_alert($job);
+
+					&cleanup_job($job);
+					delete $child{$pid};
+
+				} elsif (&WIFSIGNALED($status)) {
+					$job{$job}{'time'} = $time;
+					$job{$job}{'_stop'} = &strftime('%Y-%m-%d-%H-%M-%S', localtime($time));
+					$job{$job}{'_signal'} = &WTERMSIG($status);
+					$job{$job}{'_core'} = $status & 128;
+					$job{$job}{'reap'} += 1;
+					$job{$job}{'reap_rate'} += 1;
+
+					&log(sprintf('reaped job \'%s\': pid=%d signal=%d core=%d reap=%d', $job, $pid, $job{$job}{'_signal'}, $job{$job}{'_core'}, $job{$job}{'reap'}));
+					&send_reap_alert($job);
+
+					&cleanup_job($job);
+					delete $child{$pid};
+
+				} else {
+					&log(sprintf('received spurious SIGCHLD for job \'%s\': pid=%d status=%d', $job, $pid, $status));
+				}
+			}
+		}
+	}
+}
+
+sub update_ps {
+	my @pid = keys %child;
+	if (@pid > 0 and open(PS, sprintf('ps --no-headers --cumulative --format pid,bsdtime,rss,pcpu,pmem --pid %s |', join(',', @pid)))) {
+		my $time = time;
+		while (my $line = <PS>) {
+			if (my ($pid, $cpuh, $cpum, $rss, $pcpu, $pmem) = ($line =~ /^ *(\d+) +(\d+):(\d+) +(\d+) +(\d+.\d+) +(\d+.\d+)/)) {
+				my $job = $child{$pid};
+				if (exists $job{$job}) {
+					if (exists $job{$job}{'_last_ps'} && exists $job{$job}{'reap_rate'}) {
+						my $_elapsed = $time - $job{$job}{'_last_ps'};
+
+						$job{$job}{'reap_rate'} *= ($job{$job}{'reap_rate_period'} - $_elapsed) / $job{$job}{'reap_rate_period'};
+					}
+
+					$job{$job}{'_cputime'} = ($cpuh * 60) + $cpum;
+					$job{$job}{'_rss'} = $rss;
+					$job{$job}{'_pcpu'} = $pcpu;
+					$job{$job}{'_pmem'} = $pmem;
+					$job{$job}{'_last_ps'} = $time;
+
+					kill(9, $job{$job}{'_pid'}) if (exists $job{$job}{'rsslimit'} and $job{$job}{'_rss'} > $job{$job}{'rsslimit'});
+					kill(9, $job{$job}{'_pid'}) if (exists $job{$job}{'pmemlimit'} and $job{$job}{'_pmem'} > $job{$job}{'pmemlimit'});
+#					kill(9, $job{$job}{'_pid'}) if (exists $job{$job}{'cpulimit'} and $job{$job}{'_cputime'} > $job{$job}{'cpulimit'});
+				} else {
+					delete $child{$pid};
+				}
+			}
+		}
+		close(PS);
+	}
+}
+
+sub setup_job_filters {
+	my $job = shift;
+	
+	if (exists $job{$job}{'stdoutfilter'}) {
+		open(OLDOUT, '>&STDOUT');
+		my $pid = open(STDOUT, '|-');
+		if (defined $pid and $pid == 0) {
+			open(STDOUT, '>&OLDOUT');
+			open(STDERR, '>&OLDOUT');
+			exec(@{$job{$job}{'stdoutfilter'}}) or die "exec failed: $!";
+		}
+		close(OLDOUT);
+	}
+	if (exists $job{$job}{'stderrfilter'}) {
+		open(OLDERR, '>&STDERR');
+		my $pid = open(STDERR, '|-');
+		if (defined $pid and $pid == 0) {
+			open(STDOUT, '>&OLDERR');
+			open(STDERR, '>&OLDERR');
+			exec(@{$job{$job}{'stderrfilter'}}) or die "exec failed: $!";
+		}
+		close(OLDERR);
+	}
+}
+
+sub setup_job_logs {
+	my $job = shift;
+
+	open(STDIN, '< /dev/null');
+	if ($job{$job}{'type'} eq 'single') {
+		mkdir("$logpath/$job") unless (-e "$logpath/$job");
+		my $start = $job{$job}{'_start'};
+		open(STDOUT, "> $logpath/$job/$start.out");
+		open(STDERR, "> $logpath/$job/$start.err");
+	}
+	else {
+		open(STDOUT, ">> $logpath/$job.out");
+		open(STDERR, ">> $logpath/$job.err");
+	}
+}
+
+sub setup_job {
+	my $job = shift;
+
+	if ($job{$job}{'setsid'}) {
+		&setsid() or die "setsid: $!";
+	}
+	if (exists $job{$job}{'env'}) {
+		@ENV{keys %{$job{$job}{'env'}}} = values %{$job{$job}{'env'}};
+	}
+	if (exists $job{$job}{'nice'}) {
+		&setpriority(PRIO_PROCESS, 0, $job{$job}{'nice'}) or die "setpriority: $!";
+	}
+	if (exists $job{$job}{'fdlimit'}) {
+		&setrlimit(RLIMIT_NOFILE, $job{$job}{'fdlimit'}, $job{$job}{'fdlimit'}) or die "setrlimit: $!";
+	}
+#	if (exists $job{$job}{'cpulimit'}) {
+#		&setrlimit(RLIMIT_CPU, $job{$job}{'cpulimit'}, $job{$job}{'cpulimit'});
+#	}
+#	if (exists $job{$job}{'chroot'}) {
+#		chroot($job{$job}{'chroot'}) or die "chroot: $!";
+#	}
+	if (exists $job{$job}{'gid'}) {
+		&setgid($job{$job}{'gid'}) or die "setgid: $!";
+	}
+	if (exists $job{$job}{'uid'}) {
+		&setuid($job{$job}{'uid'}) or die "setuid: $!";
+	}
+	if (exists $job{$job}{'cwd'}) {
+		chdir($job{$job}{'cwd'}) or die "chdir: $!";
+	}
+	if (exists $job{$job}{'umask'}) {
+		umask(oct($job{$job}{'umask'})) or die "umask: $!";
+	}
+}
+
+sub stop_job {
+	my $job = shift;
+	return unless (exists $job{$job});
+	if (!exists $job{$job}{'type'}) {
+		delete $job{$job}{'restart'};
+
+		return unless (exists $job{$job}{'_pid'});
+
+		&log("stopping job '$job'");
+
+		$job{$job}{'time'} = time;
+
+		kill(15, $job{$job}{'_pid'});
+	}
+	elsif ($job{$job}{'type'} eq 'single') {
+		return unless (exists $job{$job}{'_pid'});
+
+		&log("stopping job '$job'");
+
+		$job{$job}{'time'} = time;
+
+		kill(15, $job{$job}{'_pid'});
+	}
+	elsif ($job{$job}{'type'} eq 'inetd') {
+		delete $job{$job}{'restart'};
+
+		return unless (exists $job{$job}{'listen'});
+
+		&log("stopping job '$job'");
+
+		$job{$job}{'time'} = time;
+
+		$poll->remove($job{$job}{'listen'});
+		$job{$job}{'listen'}->close;
+		delete $job{$job}{'listen'};
+	}
+}
+
+sub start_job {
+	my $job = shift;
+	return unless (exists $job{$job});
+	if (!exists $job{$job}{'type'}) {
+		return if (exists $job{$job}{'_pid'});
+
+		&log("starting job '$job'");
+		$job{$job}{'restart'} = 1;
+		$job{$job}{'time'} = time;
+
+		$job{$job}{'_start'} = &strftime('%Y-%m-%d-%H-%M-%S', localtime($job{$job}{'time'}));
+
+		my $pid = fork;
+		if (defined $pid) {
+			if ($pid == 0) {
+				&setup_job_logs($job);
+				&setup_job($job);
+				&setup_job_filters($job);
+
+				exec(@{$job{$job}{'command'}}) or die "exec failed: $!";
+			} elsif ($pid > 0) {
+				$child{$pid} = $job;
+				$job{$job}{'_pid'} = $pid;
+			}
+		}
+	}
+	elsif ($job{$job}{'type'} eq 'inetd') {
+		return if (exists $job{$job}{'listen'});
+
+		&log("starting job '$job'");
+		$job{$job}{'restart'} = 1;
+		$job{$job}{'time'} = time;
+
+		if (exists $job{$job}{'port'}) {
+			if (my $listen = IO::Socket::INET->new(Listen => 5, LocalPort => $job{$job}{'port'}, Proto => 'tcp', ReuseAddr => 1)) {
+				$handle{$listen}{'type'} = 'inetd';
+				$job{$job}{'listen'} = $listen;
+				$poll->mask($listen => POLLIN);
+			}
+		}
+
+	}
+}
+
+sub run_job {
+	my $job = shift;
+	return unless (exists $job{$job});
+	if ($job{$job}{'type'} eq 'single') {
+		return if (exists $job{$job}{'_pid'});
+
+		&log("running job '$job'");
+		$job{$job}{'time'} = time;
+
+		$job{$job}{'_start'} = &strftime('%Y-%m-%d-%H-%M-%S', localtime($job{$job}{'time'}));
+
+		my $pid = fork;
+		if (defined $pid) {
+			if ($pid == 0) {
+				&setup_job_logs($job);
+				&setup_job($job);
+				&setup_job_filters($job);
+				$ENV{'HEYMON_START'} = $job{$job}{'_start'};
+
+				exec(@{$job{$job}{'command'}}, @{$job{$job}{'_args'}}) or die "exec failed: $!";
+			} elsif ($pid > 0) {
+				$child{$pid} = $job;
+				$job{$job}{'_pid'} = $pid;
+			}
+		}
+	}
+}
+
+sub job_status {
+	my $job = shift;
+	return unless (exists $job{$job});
+	if (!exists $job{$job}{'type'}) {
+		if (exists $job{$job}{'_pid'}) {
+			if ($job{$job}{'restart'}) {
+				return sprintf('RUNNING (pid %d)', $job{$job}{'_pid'});
+			} else {
+				if (time < $job{$job}{'time'} + 30) {
+					return 'STOPPING';
+				} else {
+					return 'KILLING';
+				}
+			}
+		} else {
+			if ($job{$job}{'restart'}) {
+				if (time < $job{$job}{'time'} + 10) {
+					return 'QUEUED';
+				} else {
+					return 'STARTING';
+				}
+			} else {
+				return 'IDLE';
+			}
+		}
+	}
+	elsif ($job{$job}{'type'} eq 'single') {
+		if (exists $job{$job}{'_pid'}) {
+			return sprintf('RUNNING (pid %d)', $job{$job}{'_pid'});
+		} else {
+			return 'IDLE';
+		}
+	}
+	elsif ($job{$job}{'type'} eq 'inetd') {
+		if (exists $job{$job}{'listen'}) {
+			return sprintf('LISTENING (port %d)', $job{$job}{'port'});
+		} else {
+			if ($job{$job}{'restart'}) {
+				return 'STARTING';
+			} else {
+				return 'IDLE';
+			}
+		}
+
+	}
+	return 'UNKNOWN';
+}
+
+sub show_job {
+	my $handle = shift;
+	my $job = shift;
+	my $header = " heymon on $hostname "; $header = "-$header-" while (length $header < 80);
+	$handle->printf(substr($header, 0, 80) . "\n");
+	$handle->printf(' %-15s  %8s  %-20s  %-3s  %s' . "\n", 'Job', 'Cycle', 'Status', 'CPU', 'Since');
+	$handle->print('-' x 80);
+	$handle->print("\n");
+
+	my @job;
+	if (exists $job{$job}) {
+		@job = ($job);
+	} else {
+		@job = grep(/$job/, &jobs);
+	}
+
+	if (scalar(@job)) {
+		foreach my $job (@job) { # yes, I know I'm re-defining the $job variable
+			$handle->printf(' %-15s  %8d  %-20s  %3d  %s' . "\n", $job, $job{$job}{'reap'}, &job_status($job), exists $job{$job}{'_pcpu'} ? $job{$job}{'_pcpu'} : 0, scalar(localtime($job{$job}{'time'})));
+		}
+		$handle->print("\n");
+	} else {
+		$handle->print("No jobs matched: $job\n");
+	}
+}
+
+sub dump_job {
+	my $handle = shift;
+	my $job = shift;
+	my @job;
+	if (exists $job{$job}) {
+		@job = ($job);
+	} else {
+		@job = grep(/$job/, &jobs);
+	}
+
+	if (scalar(@job)) {
+		foreach my $job (@job) { # yes, I know I'm re-defining the $job variable
+			my $dump = Data::Dumper->Dump([ $job{$job} ], [ 'job' ]);
+			$dump =~ s/^\$job/\$job{'$job'}/;
+			$handle->print($dump);
+		}
+	} else {
+		$handle->print("No jobs matched: $job\n");
+	}
+}
+
+sub sendmail {
+	my $msg = shift;
+	my $to = shift;
+
+	if ($reap_alerts_smtp_host) {
+		if (my $smtp = Net::SMTP->new($reap_alerts_smtp_host)) {
+			$smtp->mail($reap_alerts_from);
+			$smtp->to($to);
+
+			$smtp->data();
+			$smtp->datasend($msg);
+			$smtp->dataend();
+
+			$smtp->quit;
+		}
+	} else {
+		if (open(SENDMAIL, '| /usr/lib/sendmail -t')) {
+			print SENDMAIL $msg;
+			close(SENDMAIL);
+		}
+	}
+}
+
+sub send_reap_alert {
+	my $job = shift;
+	my $time = time;
+	
+	return if (exists $job{$job}{'type'});
+	return unless ($job{$job}{'restart'});
+	return unless ($job{$job}{'reap_rate'} > $job{$job}{'reap_rate_threshold'});
+	return if (exists $job{$job}{'suppress_reap_alerts_until'} and $time < $job{$job}{'suppress_reap_alerts_until'});
+	return unless (defined $job{$job}{'reap_alerts_to'});
+
+	my $msg = <<EOT;
+From: heymon <$reap_alerts_from>
+To: $job{$job}{'reap_alerts_to'}
+Subject: $job on $hostname has exited!
+
+$job on $hostname has exited!
+EOT
+
+	&sendmail($msg, $job{$job}{'reap_alerts_to'});
+
+	$job{$job}{'suppress_reap_alerts_until'} = $time + 300;
+}
+
+sub ctrlsocklisten {
+	my $uid = shift;
+	my ($name, $passwd, undef, $gid, $quota, $comment, $gcos, $dir, $shell, $expire) = getpwuid($uid);
+	return undef if (!defined $name);
+	my $path = &tmpnam;
+	my $sock = IO::Socket::UNIX->new(Listen => 5, Local => $path) or goto CLEANUP;
+	chmod(0600, $path);
+	chown($uid, -1, $path);
+	$handle{$sock}{'type'} = 'ctrlsocklisten';
+	$handle{$sock}{'user'} = $uid;
+	$handle{$sock}{'path'} = $path;
+	return $sock;
+
+CLEANUP:
+	unlink($path);
+	return undef;
+}
+
+sub create_usersock {
+	!-e $usersock or unlink($usersock) or die "couldn't create user socket: $!";
+	my $usersocklisten = IO::Socket::UNIX->new(
+		Listen => 5,
+		Local => $usersock
+	) or die "couldn't create user socket: $!";
+	chmod(0777, $usersock);
+	$handle{$usersocklisten}{'type'} = 'usersocklisten';
+	$poll->mask($usersocklisten => POLLIN);
+}
+
+sub create_ctrlport {
+	my $ctrlportlisten = IO::Socket::INET->new(
+		Listen => 5,
+		(defined $ctrlhost ? (LocalAddr => $ctrlhost) : ()),
+		LocalPort => $ctrlport,
+		Proto => 'tcp',
+		ReuseAddr => 1
+	) or die "couldn't create control port: $!";
+	$handle{$ctrlportlisten}{'type'} = 'ctrlportlisten';
+	$poll->mask($ctrlportlisten => POLLIN);
+}
+
+sub cleanup_handle {
+	my $handle = shift;
+	$poll->remove($handle);
+	$handle->close;
+	delete $handle{$handle};
+}
+
+sub process_ctrlport_input {
+	my $handle = shift;
+	my $line = shift;
+
+	$line =~ s/[\s]*$//;
+	my @cmd = &quotewords(q(\s+), 0, $line);
+
+	&process_ctrl_input($handle, @cmd);
+}
+
+sub process_ctrlsock_input {
+	my $handle = shift;
+	my $line = shift;
+
+	my $cmd = Safe->new->reval($line);
+
+	&process_ctrl_input($handle, @$cmd);
+}
+
+sub process_ctrl_input {
+	my $handle = shift;
+	my $cmd = shift;
+
+	if ($cmd =~ /^(dump_all|da)$/) {
+		&dump_job($handle, '.');
+
+	} elsif ($cmd =~ /^(dump_job|dump|dj)$/) {
+		my $j = shift;
+		&dump_job($handle, $j);
+
+	} elsif ($cmd =~ /^(show_all|print_all|sa|pa)$/) {
+		&show_job($handle, '.');
+
+	} elsif ($cmd =~ /^(show_job|show|print_job|sj|pj)$/) {
+		my $j = shift;
+		&show_job($handle, $j);
+
+	} elsif ($cmd =~ /^(run_job|run|rj)$/) {
+		my $j = shift;
+		
+		my @job;
+		if (exists $job{$j}) {
+			@job = ($j);
+		} else {
+			@job = grep(/$j/, &jobs);
+		}
+
+		if (scalar(@job)) {
+			foreach my $job (@job) {
+				$job{$job}{'_args'} = [ @_ ];
+				&run_job($job);
+			}
+		} else {
+			$handle->print("No jobs matched: $j\n");
+		}
+
+	} elsif ($cmd =~ /^(start_job|start|aj)$/) {
+		my $j = shift;
+		
+		my @job;
+		if (exists $job{$j}) {
+			@job = ($j);
+		} else {
+			@job = grep(/$j/, &jobs);
+		}
+
+		if (scalar(@job)) {
+			foreach my $job (@job) {
+				&start_job($job);
+			}
+		} else {
+			$handle->print("No jobs matched: $j\n");
+		}
+
+	} elsif ($cmd =~ /^(stop_job|stop|oj)$/) {
+		my $j = shift;
+		
+		my @job;
+		if (exists $job{$j}) {
+			@job = ($j);
+		} else {
+			@job = grep(/$j/, &jobs);
+		}
+
+		if (scalar(@job)) {
+			foreach my $job (@job) {
+				&stop_job($job);
+			}
+		} else {
+			$handle->print("No jobs matched: $j\n");
+		}
+
+	} elsif ($cmd =~ /^(hup_job|hup|hj)$/) {
+		my $j = shift;
+		
+		my @job;
+		if (exists $job{$j}) {
+			@job = ($j);
+		} else {
+			@job = grep(/$j/, &jobs);
+		}
+
+		if (scalar(@job)) {
+			foreach my $job (@job) {
+				kill(1, $job{$job}{'_pid'}) if (exists $job{$job}{'_pid'});
+			}
+		} else {
+			$handle->print("No jobs matched: $j\n");
+		}
+
+	} elsif ($cmd =~ /^eval$/) {
+		$safe->reval(join(' ', @_));
+		$handle->print("reval: $@\n") if ($@);
+	} elsif ($cmd eq 'shutdown') {
+		foreach my $job (&jobs) {
+			&stop_job($job);
+		}
+		exit;
+	} elsif ($cmd =~ /^(quit|exit)$/) {
+		&cleanup_handle($handle);
+	} elsif ($cmd eq 'help') {
+		$handle->print("print_job foo    - displays job status for the job named foo (shortcut = pj)\n");
+		$handle->print("start_job foo    - starts the job named foo (shortcut = aj)\n");
+		$handle->print("stop_job foo     - stops the job named foo (shortcut = oj)\n");
+		$handle->print("hup_job foo      - sends the job named foo a HUP signal (shortcut = hj)\n");
+		$handle->print("dump_job foo     - dumps all data for the job named foo (shortcut = dj)\n");
+		$handle->print("show_all         - displays job status for all jobs (shortcut = sa)\n");
+		$handle->print("dump_all         - dumps all data for all jobs (shortcut = da)\n");
+		$handle->print("shutdown         - stops all jobs and exits\n");
+	} elsif ($cmd eq 'infodump') {
+		$handle->print("===== infodump begin =====\n");
+		$handle->print(&encode_base64(join('', Data::Dumper->Dump(
+			[\%default, \%job],
+			[qw(default job)]
+		))));
+		$handle->print("===== infodump end =====\n");
+	
+	} else {
+		$handle->print("huh? (try 'help')\n");
+	}
+}
+
+sub poll_handles {
+	$poll->poll(10);
+	foreach my $handle ($poll->handles) {
+		my $events = $poll->events($handle);
+		if ($events & POLLIN) {
+			if ($handle{$handle}{'type'} eq 'ctrlportlisten') {
+				my $accept = $handle->accept;
+				$handle{$accept}{'type'} = 'ctrlport';
+				$accept->autoflush(1);
+				$poll->mask($accept => POLLIN);
+				$accept->print('> ');
+			}
+			elsif ($handle{$handle}{'type'} eq 'usersocklisten') {
+				my $accept = $handle->accept;
+				$handle{$accept}{'type'} = 'usersock';
+				$accept->autoflush(1);
+				$poll->mask($accept => POLLIN);
+			}
+			elsif ($handle{$handle}{'type'} eq 'ctrlsocklisten') {
+				my $accept = $handle->accept;
+				$handle{$accept}{'type'} = 'ctrlsock';
+				$accept->autoflush(1);
+				$poll->mask($accept => POLLIN);
+
+				unlink($handle{$handle}{'path'});
+				&cleanup_handle($handle);
+			}
+			elsif ($handle{$handle}{'type'} eq 'inetd') {
+				foreach my $job (grep { exists $job{$_}{'type'} and $job{$_}{'type'} eq 'inetd' } &jobs) {
+					if (exists $job{$job}{'listen'} and $job{$job}{'listen'} eq $handle) {
+						my $accept = $handle->accept;
+						my $pid = fork;
+						if (defined $pid) {
+							if ($pid == 0) {
+								$handle->close;
+
+								&setup_job_logs($job);
+								&setup_job($job);
+
+								&log(sprintf('accepted a connection from %s', $accept->peerhost));
+
+								my $fileno = fileno $accept;
+								open(STDIN, "<&$fileno");
+								open(STDOUT, ">&$fileno");
+								close(STDERR);
+								exec(@{$job{$job}{'command'}}) or die 'exec failed';
+							} else {
+								$accept->close;
+							}
+						}
+						last;
+					}
+				}
+			}
+			elsif ($handle{$handle}{'type'} eq 'usersock') {
+				my $line = <$handle>;
+				if (defined $line) {
+					$line =~ s/[\s]*$//;
+					if ($line =~ /^(\d+)$/) {
+						my $uid = $1;
+						if (my $ctrlsocklisten = &ctrlsocklisten($uid)) {
+							$poll->mask($ctrlsocklisten => POLLIN);
+							$handle->print("ok: ".$handle{$ctrlsocklisten}{'path'}."\n");
+						} else {
+							$handle->print("not ok\n");
+						}
+					}
+				}
+				&cleanup_handle($handle);
+			}
+			elsif ($handle{$handle}{'type'} eq 'ctrlport') {
+				my $line = <$handle>;
+				if (defined $line) {
+					&process_ctrlport_input($handle, $line);
+
+					$handle->print('> ');
+				} else {
+					&cleanup_handle($handle);
+				}
+			}
+			elsif ($handle{$handle}{'type'} eq 'ctrlsock') {
+				my $line = <$handle>;
+				if (defined $line) {
+					&process_ctrlsock_input($handle, $line);
+				}
+				&cleanup_handle($handle);
+			}
+		}
+	}
+}
+
+# ========== main ====================================================
+
+chdir('/tmp') or die "chdir: $!";
+
+open(STDIN, '< /dev/null');
+open(STDOUT, ">> $logpath/heymon.out") or die "couldn't open heymon.out: $!";
+STDOUT->autoflush();
+open(STDERR, ">> $logpath/heymon.err") or die "couldn't open heymon.err: $!";
+STDERR->autoflush();
+
+&process_config($etcpath);
+&process_options;
+&process_defaults;
+
+&create_usersock if ($usersock);
+&create_ctrlport if ($ctrlport);
+
+if ($background) {
+	exit if (fork());
+	&setsid();
+}
+
+$SIG{'CHLD'} = \&reap;
+while (1) {
+	&handle_reaped;
+
+	foreach my $job (&jobs) {
+		my $status = &job_status($job);
+		if ($status eq 'STARTING') {
+			&start_job($job);
+		} elsif ($status eq 'KILLING') {
+			kill(9, $job{$job}{'_pid'});
+		}
+	}
+
+	&update_ps;
+	&poll_handles;
+}

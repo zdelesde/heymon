@@ -1,0 +1,64 @@
+#!/bin/bash
+# $Header: /u01/cvs/heymon/heymon.init,v 2.1 2008/12/03 19:48:57 zac Exp $
+#
+#	/etc/rc.d/init.d/heymon
+#
+# Starts heymon as a daemon
+#
+# chkconfig: - 65 35
+# description: Heymon Process Manager
+# processname: heymon
+# Source function library.
+. /etc/init.d/functions
+
+test -x /usr/sbin/heymon || exit 0
+
+RETVAL=0
+
+start() {
+        echo -n $"Starting heymon: "
+	daemon /usr/sbin/heymon -b
+	RETVAL=$?
+	[ $RETVAL -eq 0 ] && touch /var/lock/subsys/heymon
+	echo
+}
+
+stop() {
+	echo -n $"Stopping heymon: "
+	killproc /usr/sbin/heymon
+	RETVAL=$?
+	[ $RETVAL -eq 0 ] && rm -f /var/lock/subsys/heymon
+	echo
+}
+
+#
+#	See how we were called.
+#
+case "$1" in
+  start)
+	start
+	;;
+  stop)
+	stop
+	;;
+  reload|restart)
+	stop
+	start
+	RETVAL=$?
+	;;
+  condrestart)
+	if [ -f /var/lock/subsys/heymon ]; then
+	    stop
+	    start
+	fi
+	;;
+  status)
+	status /usr/sbin/heymon
+	RETVAL=$?
+	;;
+  *)
+	echo $"Usage: $0 {condrestart|start|stop|restart|reload|status}"
+	exit 1
+esac
+
+exit $RETVAL

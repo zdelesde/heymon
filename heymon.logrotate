@@ -1,0 +1,12 @@
+#
+# $Header: /u01/cvs/heymon/heymon.logrotate,v 2.3 2010/10/30 15:58:11 zac Exp $
+#
+# This file should be installed as /etc/logrotate.d/heymon
+#
+
+/var/log/heymon/*out /var/log/heymon/*err /var/log/heymon/*log {
+	missingok
+	copytruncate
+#	daily
+#	rotate 10
+}

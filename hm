@@ -1,0 +1,24 @@
+#!/usr/bin/perl -w
+
+# $Header: /u01/cvs/heymon/hm,v 2.4 2013/02/10 16:51:39 zac Exp $
+
+use strict;
+no warnings qw(uninitialized);
+use IO::Socket;
+use Data::Dumper;
+$Data::Dumper::Indent = 0;
+$Data::Dumper::Useqq = 1;
+
+my $usersockfile = q(/tmp/heymon.sock);
+my $usersock = IO::Socket::UNIX->new($usersockfile) or die;
+$usersock->printf("%d\n", $<);
+my $line = <$usersock>;
+$line =~ s/[\s]*$//;
+$usersock->close;
+
+my $ctrlsockfile = $1 if ($line =~ /^ok: (.+)$/);
+my $ctrlsock = IO::Socket::UNIX->new($ctrlsockfile) or die;
+$ctrlsock->printf("%s\n", &Dumper(\@ARGV));
+while ($line = <$ctrlsock>) {
+	print $line;
+}

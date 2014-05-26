@@ -1,0 +1,81 @@
+#
+# This file contains a lot of example heymon job definitions
+# $Header: /u01/cvs/heymon/jobs.example,v 2.4 2012/08/14 15:11:12 zac Exp $
+#
+
+# override the global value for the reap rate threshold
+$reap_rate_threshold = 2;
+
+# override global value for who to send reap alerts to
+$reap_alerts_to = '1234567890@messaging.sprintpcs.com';
+
+# icecast: run as user 1000, and set some environment variables
+$job{'icecast'} = {
+	'uid' => 1000,
+	'gid' => 1000,
+	'env' => {
+		'LD_LIBRARY_PATH' => '/home/wozzle/icecast/lib',
+		'SOME_OTHER_VAR' => 'some other value',
+	},
+	'command' => [ '/home/wozzle/icecast/bin/icecast -c /home/wozzle/icecast/etc/icecast.xml' ],
+};
+
+# apache: run in a separate session, that way it doesn't kill heymon when heymon kills it
+$job{'apache'} = {
+	'setsid' => 1,
+	'command' => [ '/usr/sbin/httpd -D FOREGROUND' ],
+};
+
+# heyu: run as "nobody", also post-process its output, grepping out debug garbage
+$job{'heyu'} = {
+	'uid' => 99,
+	'gid' => 99,
+	'stdoutfilter' => [ 'grep -v garbage' ],
+	'command' => [ '/opt/heyu/heyu monitor' ],
+};
+
+# cvs pserver: an excellent example of an "inetd-style" job
+$job{'cvsd'} = {
+	'type' => 'inetd',
+	'port' => 2401,
+	'command' => [ '/usr/bin/cvs -f --allow-root=/home/wozzle/cvs pserver' ],
+};
+
+# milter-greylist: undef the reap_alerts_to option, because nobody wants to hear about it
+$job{'greylistd'} = {
+	'reap_alerts_to' => undef,
+	'command' => [ '/opt/milter-greylist/bin/milter-greylist -f /opt/milter-greylist/etc/greylist.conf -P /var/milter-greylist/milter-greylist.pid -p /var/milter-greylist/milter-greylist.sock -D' ],
+};
+
+# silly: an example job that defines every option
+$job{'silly'} = {
+	# set some environment variables
+	'env' => {
+		'SOME_VAR' => 12345,
+		'SOME_OTHER_VAR' => '/some/cool/thing',
+	},
+	# run in a separate session id
+	'setsid' => 1,
+	# run with priority 1
+	'nice' => 1,
+	# limit to 65535 file descriptors
+	'fdlimit' => 65535,
+	# run as uid 99 (nobody)
+	'uid' => 99,
+	# run as gid 99 (nobody)
+	'gid' => 99,
+	# from /some/directory
+	'cwd' => '/some/directory',
+	# run with 022 umask
+	'umask' => '022',
+	# filter stdout, adding a timestamp
+	'stdoutfilter' => [ '/some/path/timestamper' ],
+	# filter stderr, removing some garbage
+	'stderrfilter' => [ 'grep -v garbage' ],
+	# run silly with the following arguments
+	'command' => [ '/usr/bin/silly -v -l super-silly' ],
+	# if resident set size exceeds 4096, kill it
+	'rsslimit' => 4096,
+	# if resident set size exceeds 40% of memory, kill it
+	'pmemlimit' => 40,
+}
